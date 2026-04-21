@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+
+  ownedProjects   Project[]       @relation("ProjectOwner")
+  memberOf        ProjectMember[]
+}
+
+model Project {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  canvasData  Json     @default("{}")
+  ownerId     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner   User            @relation("ProjectOwner", fields: [ownerId], references: [id])
+  members ProjectMember[]
+}
+
+model ProjectMember {
+  projectId String
+  userId    String
+  role      Role     @default(EDITOR)
+  joinedAt  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+}
+
+enum Role {
+  OWNER
+  EDITOR
+}

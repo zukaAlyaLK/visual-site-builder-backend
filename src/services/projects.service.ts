@@ -83,13 +83,26 @@ export async function getProjectById(userId: string, projectId: string) {
   return { project };
 }
 
-// Обновить проект (только owner)
+// Обновить проект
+// - name / description: только owner
+// - canvasData: любой участник (EDITOR / OWNER)
 export async function updateProject(
   userId: string,
   projectId: string,
   data: { name?: string; description?: string; canvasData?: object }
 ) {
-  await assertOwner(userId, projectId);
+  // If name or description are being changed, require owner rights
+  if (data.name !== undefined || data.description !== undefined) {
+    await assertOwner(userId, projectId);
+  } else {
+    // For canvasData-only updates, just verify the user is a project member
+    const member = await prisma.projectMember.findUnique({
+      where: { projectId_userId: { projectId, userId } },
+    });
+    if (!member) {
+      throw new AppError('Access denied: You are not a member of this project', 403);
+    }
+  }
 
   const project = await prisma.project.update({
     where: { id: projectId },

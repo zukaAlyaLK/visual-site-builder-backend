@@ -1,11 +1,18 @@
 import { Server, Socket } from 'socket.io';
 import http from 'http';
 import jwt from 'jsonwebtoken';
+import * as Y from 'yjs';
 import { prisma } from './prisma';
 import { RoomParticipant } from './types';
 
-// In-memory registry of active participants: roomName (e.g. project:projectId) -> RoomParticipant[]
+// In-memory registry of active participants: roomName -> RoomParticipant[]
 const roomParticipants = new Map<string, RoomParticipant[]>();
+
+// In-memory Yjs documents per room (for relay + sync to new joiners)
+const roomDocs = new Map<string, Y.Doc>();
+
+// Debounce timers for DB persistence per room
+const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // A preset color palette for room participants
 const COLORS = [
@@ -21,8 +28,52 @@ const COLORS = [
   '#33FFAF', // Mint
 ];
 
+function getOrCreateDoc(roomName: string): Y.Doc {
+  if (!roomDocs.has(roomName)) {
+    roomDocs.set(roomName, new Y.Doc());
+  }
+  return roomDocs.get(roomName)!;
+}
+
 function getRandomColor(): string {
   return COLORS[Math.floor(Math.random() * COLORS.length)];
+}
+
+/**
+ * Schedule a debounced save of the room's Yjs document to the database.
+ * Saves the yElements array as canvasData.elements.
+ */
+function scheduleSave(roomName: string, projectId: string) {
+  const existing = saveTimers.get(roomName);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    saveTimers.delete(roomName);
+    const doc = roomDocs.get(roomName);
+    if (!doc) return;
+
+    try {
+      const yElements = doc.getArray<any>('elements');
+      const elements = yElements.toArray();
+
+      // Find the project owner to perform the save
+      const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { ownerId: true },
+      });
+      if (!project) return;
+
+      await prisma.project.update({
+        where: { id: projectId },
+        data: { canvasData: { elements } },
+      });
+      console.log(`💾 Auto-saved canvas for project ${projectId} (${elements.length} elements)`);
+    } catch (err: any) {
+      console.error(`Failed to auto-save project ${projectId}:`, err.message);
+    }
+  }, 3000); // 3-second debounce
+
+  saveTimers.set(roomName, timer);
 }
 
 export function initSocket(server: http.Server): Server {
@@ -34,18 +85,22 @@ export function initSocket(server: http.Server): Server {
   });
 
   // JWT Authentication Middleware for Socket.io
+  // The token MUST be passed as socket.handshake.auth.token
   io.use((socket, next) => {
     try {
       const token =
-        socket.handshake.auth.token ||
-        socket.handshake.query.token;
+        socket.handshake.auth?.token ||
+        socket.handshake.query?.token;
 
       if (!token) {
         return next(new Error('Authentication error: Token is required'));
       }
 
-      // If token has Bearer prefix, clean it
-      const cleanToken = token.startsWith('Bearer ') ? token.split(' ')[1] : token;
+      // Strip "Bearer " prefix if present
+      const cleanToken = typeof token === 'string' && token.startsWith('Bearer ')
+        ? token.slice(7)
+        : token as string;
+
       if (!cleanToken) {
         return next(new Error('Authentication error: Invalid Token format'));
       }
@@ -61,7 +116,7 @@ export function initSocket(server: http.Server): Server {
   io.on('connection', async (socket: Socket) => {
     const userId = socket.data.userId;
 
-    // Fetch user details from database to get their name
+    // Fetch user details from database
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { id: true, name: true, email: true },
@@ -75,10 +130,10 @@ export function initSocket(server: http.Server): Server {
     socket.data.userName = user.name;
     console.log(`🔌 User connected: ${user.name} (${user.email}) - Socket ID: ${socket.id}`);
 
-    // Store joined rooms for this socket to clean up on disconnect
+    // Store joined rooms for cleanup on disconnect
     const joinedRooms = new Set<string>();
 
-    // 1. Join Project Room
+    // ─── 1. Join Project Room ────────────────────────────────────────────────
     socket.on('join-project', async ({ projectId }: { projectId: string }) => {
       try {
         if (!projectId) {
@@ -86,11 +141,9 @@ export function initSocket(server: http.Server): Server {
           return;
         }
 
-        // Verify that the user has access to the project
+        // Verify the user has access to the project
         const memberAccess = await prisma.projectMember.findUnique({
-          where: {
-            projectId_userId: { projectId, userId },
-          },
+          where: { projectId_userId: { projectId, userId } },
         });
 
         if (!memberAccess) {
@@ -102,17 +155,14 @@ export function initSocket(server: http.Server): Server {
         socket.join(roomName);
         joinedRooms.add(roomName);
 
-        // Add to active participants list
+        // ── Participants ──────────────────────────────────────────────────────
         if (!roomParticipants.has(roomName)) {
           roomParticipants.set(roomName, []);
         }
-
         const participants = roomParticipants.get(roomName)!;
-        
-        // Avoid duplicate entries for the same socket/user in this room
-        const existingParticipantIndex = participants.findIndex(p => p.socketId === socket.id);
-        
-        if (existingParticipantIndex === -1) {
+
+        const existingIndex = participants.findIndex(p => p.socketId === socket.id);
+        if (existingIndex === -1) {
           const newParticipant: RoomParticipant = {
             socketId: socket.id,
             userId: user.id,
@@ -120,12 +170,21 @@ export function initSocket(server: http.Server): Server {
             color: getRandomColor(),
           };
           participants.push(newParticipant);
-          socket.data.color = newParticipant.color; // store color on socket object
+          socket.data.color = newParticipant.color;
         }
 
-        // Broadcast updated list to everyone in the room
+        // Broadcast updated participant list to everyone in the room
         io.to(roomName).emit('room-participants', participants);
-        
+
+        // ── Yjs State Sync ────────────────────────────────────────────────────
+        // Send the current Yjs document state to the newly joined client
+        const doc = getOrCreateDoc(roomName);
+        const stateUpdate = Y.encodeStateAsUpdate(doc);
+        if (stateUpdate.length > 2) {
+          // Only send if doc has content (empty Y.Doc encodes to 2 bytes)
+          socket.emit('sync-state', Array.from(stateUpdate));
+        }
+
         console.log(`👥 User ${user.name} joined room ${roomName}`);
       } catch (err: any) {
         console.error(`Error joining room: ${err.message}`);
@@ -133,7 +192,7 @@ export function initSocket(server: http.Server): Server {
       }
     });
 
-    // 2. Leave Project Room
+    // ─── 2. Leave Project Room ───────────────────────────────────────────────
     socket.on('leave-project', ({ projectId }: { projectId: string }) => {
       const roomName = `project:${projectId}`;
       socket.leave(roomName);
@@ -141,53 +200,78 @@ export function initSocket(server: http.Server): Server {
 
       const participants = roomParticipants.get(roomName);
       if (participants) {
-        const updatedParticipants = participants.filter(p => p.socketId !== socket.id);
-        roomParticipants.set(roomName, updatedParticipants);
-        io.to(roomName).emit('room-participants', updatedParticipants);
+        const updated = participants.filter(p => p.socketId !== socket.id);
+        roomParticipants.set(roomName, updated);
+        io.to(roomName).emit('room-participants', updated);
       }
+
+      // Clean up empty room doc to free memory
+      if (!io.sockets.adapter.rooms.has(roomName)) {
+        roomDocs.delete(roomName);
+        roomParticipants.delete(roomName);
+      }
+
       console.log(`🚪 User ${user.name} left room ${roomName}`);
     });
 
-    // 3. Sync Cursor Movements
+    // ─── 3. Yjs Update Relay ─────────────────────────────────────────────────
+    // Receives a Yjs binary update from a client, merges it into the room doc,
+    // and broadcasts to all other clients in the room.
+    socket.on('yjs-update', ({ projectId, update }: { projectId: string; update: number[] }) => {
+      const roomName = `project:${projectId}`;
+      if (!socket.rooms.has(roomName)) return;
+
+      try {
+        const updateBytes = new Uint8Array(update);
+        const doc = getOrCreateDoc(roomName);
+
+        // Apply update to the server-side doc (so new joiners get full state)
+        Y.applyUpdate(doc, updateBytes, 'server');
+
+        // Relay to all other clients in the room
+        socket.to(roomName).emit('yjs-update', { update });
+
+        // Schedule debounced DB persistence
+        scheduleSave(roomName, projectId);
+      } catch (err: any) {
+        console.error(`Yjs update error in room ${roomName}:`, err.message);
+      }
+    });
+
+    // ─── 4. Cursor Movement Relay ────────────────────────────────────────────
     socket.on('cursor-move', ({ projectId, x, y }: { projectId: string; x: number; y: number }) => {
       const roomName = `project:${projectId}`;
-      if (socket.rooms.has(roomName)) {
-        socket.to(roomName).emit('cursor-moved', {
-          userId: user.id,
-          userName: user.name,
-          color: socket.data.color,
-          x,
-          y,
-        });
-      }
+      if (!socket.rooms.has(roomName)) return;
+
+      socket.to(roomName).emit('cursor-moved', {
+        socketId: socket.id,
+        userId: user.id,
+        userName: user.name,
+        color: socket.data.color,
+        x,
+        y,
+      });
     });
 
-    // 4. Live Canvas Updates
-    socket.on('canvas-update', ({ projectId, canvasData }: { projectId: string; canvasData: any }) => {
-      const roomName = `project:${projectId}`;
-      if (socket.rooms.has(roomName)) {
-        // Broadcast the update to all other collaborators in the room
-        socket.to(roomName).emit('canvas-updated', {
-          canvasData,
-          updatedBy: user.id,
-        });
-      }
-    });
-
-    // 5. Handle Disconnect
+    // ─── 5. Disconnect ───────────────────────────────────────────────────────
     socket.on('disconnect', () => {
       console.log(`🔌 User disconnected: ${user.name} - Socket ID: ${socket.id}`);
-      
+
       for (const roomName of joinedRooms) {
         const participants = roomParticipants.get(roomName);
         if (participants) {
-          const updatedParticipants = participants.filter(p => p.socketId !== socket.id);
-          roomParticipants.set(roomName, updatedParticipants);
-          
-          // Broadcast to remaining users
-          io.to(roomName).emit('room-participants', updatedParticipants);
+          const updated = participants.filter(p => p.socketId !== socket.id);
+          roomParticipants.set(roomName, updated);
+          io.to(roomName).emit('room-participants', updated);
+        }
+
+        // Clean up empty room doc
+        if (!io.sockets.adapter.rooms.has(roomName)) {
+          roomDocs.delete(roomName);
+          roomParticipants.delete(roomName);
         }
       }
+
       joinedRooms.clear();
     });
   });

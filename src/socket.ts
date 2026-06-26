@@ -177,13 +177,32 @@ export function initSocket(server: http.Server): Server {
         io.to(roomName).emit('room-participants', participants);
 
         // ── Yjs State Sync ────────────────────────────────────────────────────
-        // Send the current Yjs document state to the newly joined client
         const doc = getOrCreateDoc(roomName);
-        const stateUpdate = Y.encodeStateAsUpdate(doc);
-        if (stateUpdate.length > 2) {
-          // Only send if doc has content (empty Y.Doc encodes to 2 bytes)
-          socket.emit('sync-state', Array.from(stateUpdate));
+
+        // If the server's in-memory doc is empty, seed it from the DB before
+        // sending state to the client. This means the SERVER is always the
+        // source of truth — clients never need to push DB data into Yjs.
+        const yElements = doc.getArray<any>('elements');
+        if (yElements.length === 0) {
+          const project = await prisma.project.findUnique({
+            where: { id: projectId },
+            select: { canvasData: true },
+          });
+          const savedElements: any[] = (project?.canvasData as any)?.elements ?? [];
+          if (savedElements.length > 0) {
+            doc.transact(() => {
+              yElements.delete(0, yElements.length);
+              yElements.push(savedElements);
+            });
+            console.log(`📥 Seeded room ${roomName} from DB (${savedElements.length} elements)`);
+          }
         }
+
+        // Always send current doc state to the newly joined client.
+        // Even if the doc was just empty-seeded, we send so the client knows
+        // the server is authoritative and should NOT seed from its own DB copy.
+        const stateUpdate = Y.encodeStateAsUpdate(doc);
+        socket.emit('sync-state', Array.from(stateUpdate));
 
         console.log(`👥 User ${user.name} joined room ${roomName}`);
       } catch (err: any) {
